@@ -33,9 +33,14 @@ jobs:
 
       - name: Get today's script from Make
         run: |
-          jq -nc --arg t "$MAKE_TOKEN" '{event:"generate",token:$t}' \
-            | curl -sS --fail --max-time 90 -X POST -H "Content-Type: application/json" -d @- "$MAKE_URL" -o content.txt
-          grep -q '###' content.txt || { echo "Unexpected reply from Make:"; cat content.txt; exit 1; }
+          for i in 1 2 3 4 5; do
+            jq -nc --arg t "$MAKE_TOKEN" '{event:"generate",token:$t}' \
+              | curl -sS --max-time 90 -X POST -H "Content-Type: application/json" -d @- "$MAKE_URL" -o content.txt || true
+            if grep -q '###' content.txt 2>/dev/null; then break; fi
+            echo "Attempt $i returned no script:"; cat content.txt 2>/dev/null; echo
+            sleep 20
+          done
+          grep -q '###' content.txt || { echo "Make did not return a script"; exit 1; }
           head -c 400 content.txt; echo
 
       - name: Render video
