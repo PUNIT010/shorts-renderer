@@ -1,14 +1,9 @@
 name: Render Short
 
 on:
+  schedule:
+    - cron: "30 0 * * 1,3,5,0"   # 06:00 IST on Mon, Wed, Fri, Sun
   workflow_dispatch:
-    inputs:
-      payload:
-        description: "JSON: title, topic, script, headings, visuals"
-        required: true
-      tag:
-        description: "Unique release tag, e.g. short-202610260600"
-        required: true
 
 permissions:
   contents: write
@@ -16,7 +11,10 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
+    env:
+      MAKE_URL: ${{ vars.MAKE_WEBHOOK_URL }}
+      MAKE_TOKEN: ${{ vars.MAKE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,15 +31,36 @@ jobs:
       - name: Install Python packages
         run: pip install edge-tts requests pillow
 
+      - name: Get today's script from Make
+        run: |
+          jq -nc --arg t "$MAKE_TOKEN" '{event:"generate",token:$t}' \
+            | curl -sS --fail --max-time 90 -X POST -H "Content-Type: application/json" -d @- "$MAKE_URL" -o content.txt
+          grep -q '###' content.txt || { echo "Unexpected reply from Make:"; cat content.txt; exit 1; }
+          head -c 400 content.txt; echo
+
       - name: Render video
-        env:
-          PAYLOAD: ${{ inputs.payload }}
-        run: python render.py
+        run: python render.py content.txt
 
       - name: Publish video as a release asset
+        id: rel
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
         run: |
-          gh release create "$TAG" out/short.mp4 out/meta.json \
-            --title "$TAG" --notes "Auto-rendered Short"
+          TAG="short-$(date -u +%Y%m%d%H%M)"
+          gh release create "$TAG" out/short.mp4 out/meta.json --title "$TAG" --notes "Auto-rendered Short"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Tell Make to upload the video
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          jq -nc --arg t "$MAKE_TOKEN" --arg tag "$TAG" --rawfile c content.txt \
+            '{event:"upload",token:$t,tag:$tag,content:$c}' \
+            | curl -sS --fail --max-time 240 -X POST -H "Content-Type: application/json" -d @- "$MAKE_URL"
+
+      - name: Alert Make if anything failed
+        if: failure()
+        run: |
+          jq -nc --arg t "$MAKE_TOKEN" --arg r "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{event:"failed",token:$t,run:$r}' \
+            | curl -sS --max-time 30 -X POST -H "Content-Type: application/json" -d @- "$MAKE_URL" || true
