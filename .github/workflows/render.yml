@@ -1,0 +1,47 @@
+name: Render Short
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: "JSON: title, topic, script, headings, visuals"
+        required: true
+      tag:
+        description: "Unique release tag, e.g. short-202610260600"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg and Hindi fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core fontconfig
+          fc-cache -f
+
+      - name: Install Python packages
+        run: pip install edge-tts requests pillow
+
+      - name: Render video
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: python render.py
+
+      - name: Publish video as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release create "$TAG" out/short.mp4 out/meta.json \
+            --title "$TAG" --notes "Auto-rendered Short"
