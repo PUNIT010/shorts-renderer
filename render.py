@@ -31,6 +31,8 @@ RATE = os.getenv("RATE", "+10%")           # slightly faster speech = faster pac
 SHOTS = max(1, int(os.getenv("SHOTS_PER_SCENE", "2")))
 MOCK = os.getenv("MOCK") == "1"
 FONT = os.getenv("CAPTION_FONT", "Noto Sans Devanagari")
+T0 = time.time()
+BUDGET = int(os.getenv("IMAGE_BUDGET", "420"))   # seconds allowed for AI images
 OUT, TMP = Path("out"), Path("tmp")
 
 TRANSITIONS = ["slideleft", "circleopen", "wipeup", "zoomin",
@@ -58,7 +60,12 @@ def load_payload():
         raw = Path(sys.argv[1]).read_text(encoding="utf-8")
     if not raw:
         sys.exit("No payload: set PAYLOAD or pass a JSON file path.")
-    data = json.loads(raw)
+    if raw.lstrip().startswith("{"):
+        data = json.loads(raw)
+    else:  # compact format: title###topic###script###headings###visuals
+        f = [x.strip() for x in raw.split("###")] + [""] * 5
+        data = {"title": f[0], "topic": f[1], "script": f[2],
+                "headings": f[3], "visuals": f[4]}
     parts = [p.strip() for p in data["script"].split("|") if p.strip()]
     heads = [p.strip() for p in data.get("headings", "").split("|")]
     heads += [""] * (len(parts) - len(heads))
@@ -79,7 +86,7 @@ def make_voice(text, path, idx):
         return
     for attempt in range(3):
         try:
-            asyncio.run(_tts(text, path))
+            asyncio.run(asyncio.wait_for(_tts(text, path), 90))
             if Path(path).exists() and Path(path).stat().st_size > 1000:
                 return
         except Exception as e:  # network hiccup
@@ -97,30 +104,35 @@ def gradient(path, c1, c2):
     Image.composite(b, a, g).save(path, quality=92)
 
 
+FAILS = 0
+
+
 def fetch_image(prompt, path, seed):
-    if MOCK:
+    global FAILS
+    if MOCK or FAILS >= 2 or time.time() - T0 > BUDGET:   # stop waiting on a slow service
         return False
     import requests
     url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt) +
            f"?width=720&height=1280&seed={seed}&nologo=true&model=flux")
-    for attempt in range(4):
+    for attempt in range(2):
         try:
-            r = requests.get(url, timeout=120)
+            r = requests.get(url, timeout=90)
             if (r.status_code == 200 and len(r.content) > 10000
                     and r.headers.get("content-type", "").startswith("image")):
                 Path(path).write_bytes(r.content)
                 return True
             print("image status", r.status_code)
         except Exception as e:
-            print("image retry:", e)
-        time.sleep(8 * (attempt + 1))
+            print("image retry:", e, flush=True)
+        time.sleep(3)
+    FAILS += 1
     return False
 
 
-def ken_burns(img, dur, idx, out):
+def ken_burns(img, dur, idx, out, flip=False):
     frames = int(round((dur + XF) * FPS))
     z = "min(1.0+0.0012*on,1.25)" if idx % 2 == 0 else "max(1.25-0.0012*on,1.0)"
-    vf = (f"scale=2160:-1,zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+    vf = (("hflip," if flip else "") + f"scale=2160:-1,zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
           f":d={frames}:s={W}x{H}:fps={FPS},format=yuv420p")
     run(["ffmpeg", "-y", "-loglevel", "error", "-i", img, "-vf", vf,
          "-frames:v", frames, "-r", FPS, "-c:v", "libx264", "-preset", "veryfast",
@@ -184,17 +196,16 @@ def main():
         cursor += d_scene
 
         base = visuals[i] if i < len(visuals) else (topic or heads[i] or "abstract background")
+        img = TMP / f"img_{i}.jpg"          # one AI image per scene, reused for every shot
+        prompt = (f"{base}, vertical 9:16 cinematic illustration, vibrant colors, "
+                  "dramatic lighting, highly detailed, no text, no watermark")[:380]
+        if not fetch_image(prompt, img, random.randint(1, 10**6)):
+            gradient(img, *PALETTE[i % len(PALETTE)])
         for j in range(SHOTS):
             n = len(clips)
-            img = TMP / f"img_{n}.jpg"
-            style = "wide establishing shot" if j % 2 == 0 else "dramatic close-up detail"
-            prompt = (f"{base}, {style}, vertical 9:16 cinematic illustration, vibrant colors, "
-                      "dramatic lighting, highly detailed, no text, no watermark")[:380]
-            if not fetch_image(prompt, img, random.randint(1, 10**6)):
-                gradient(img, *PALETTE[(i + j) % len(PALETTE)])
             d = d_scene / SHOTS
             clip = TMP / f"clip_{n}.mp4"
-            ken_burns(str(img), d, n, str(clip))
+            ken_burns(str(img), d, n, str(clip), flip=(j % 2 == 1))
             clips.append(clip)
             shot_durs.append(d)
 
