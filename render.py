@@ -25,14 +25,14 @@ import urllib.parse
 from pathlib import Path
 
 W, H, FPS = 1080, 1920, 30
-XF = 0.5                                   # transition length (seconds)
+XF = 0.45                                  # transition length (seconds)
 VOICE = os.getenv("VOICE", "hi-IN-SwaraNeural")
 RATE = os.getenv("RATE", "+10%")           # slightly faster speech = faster pacing
-SHOTS = max(1, int(os.getenv("SHOTS_PER_SCENE", "2")))
+SHOTS = max(1, int(os.getenv("SHOTS_PER_SCENE", "3")))
 MOCK = os.getenv("MOCK") == "1"
 FONT = os.getenv("CAPTION_FONT", "Noto Sans Devanagari")
 T0 = time.time()
-BUDGET = int(os.getenv("IMAGE_BUDGET", "420"))   # seconds allowed for AI images
+BUDGET = int(os.getenv("IMAGE_BUDGET", "2700"))  # seconds allowed for AI images (45 min)
 OUT, TMP = Path("out"), Path("tmp")
 
 TRANSITIONS = ["slideleft", "circleopen", "wipeup", "zoomin",
@@ -104,36 +104,83 @@ def gradient(path, c1, c2):
     Image.composite(b, a, g).save(path, quality=92)
 
 
-FAILS = 0
+def rand_pair(n):
+    r = random.Random(n * 7919)
+    col = lambda: "#%02x%02x%02x" % (r.randint(10, 150), r.randint(10, 150), r.randint(10, 150))
+    return col(), col()
+
+
+SEEN = set()
+STATS = {"ok": 0, "fail": 0}
+ANGLES = ["wide establishing shot", "close-up detail shot", "dramatic low angle shot",
+          "top-down aerial view", "side view with depth", "macro close-up"]
 
 
 def fetch_image(prompt, path, seed):
-    global FAILS
-    if MOCK or FAILS >= 2 or time.time() - T0 > BUDGET:   # stop waiting on a slow service
+    """Patient fetch: Pollinations rate-limits anonymous users, so retry with back-off."""
+    if MOCK:
         return False
+    import hashlib
     import requests
-    url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt) +
-           f"?width=720&height=1280&seed={seed}&nologo=true&model=flux")
-    for attempt in range(2):
+    from PIL import Image
+    models = ["flux", "turbo", "flux"]
+    for attempt in range(7):
+        if time.time() - T0 > BUDGET:
+            print("image budget used up", flush=True)
+            break
+        model = models[attempt % len(models)]
+        url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt) +
+               f"?width=768&height=1344&seed={seed + attempt * 101}&nologo=true&model={model}")
         try:
-            r = requests.get(url, timeout=90)
-            if (r.status_code == 200 and len(r.content) > 10000
-                    and r.headers.get("content-type", "").startswith("image")):
-                Path(path).write_bytes(r.content)
-                return True
-            print("image status", r.status_code)
+            r = requests.get(url, timeout=150)
+            ok = (r.status_code == 200 and len(r.content) > 15000
+                  and r.headers.get("content-type", "").startswith("image"))
+            if ok:
+                h = hashlib.md5(r.content).hexdigest()
+                if h in SEEN:       # same picture again = placeholder / cache, not a new image
+                    print("duplicate image, retrying", flush=True)
+                else:
+                    SEEN.add(h)
+                    Path(path).write_bytes(r.content)
+                    im = Image.open(path).convert("RGB")
+                    w, hh = im.size
+                    im.crop((0, 0, w, int(hh * 0.92))).save(path, quality=93)  # drop corner watermark
+                    STATS["ok"] += 1
+                    time.sleep(4)    # be polite to the free service
+                    return True
+            else:
+                print("image status", r.status_code, flush=True)
         except Exception as e:
             print("image retry:", e, flush=True)
-        time.sleep(3)
-    FAILS += 1
+        time.sleep(min(10 + attempt * 10, 60))
+    STATS["fail"] += 1
     return False
+
+
+def motion(idx, frames):
+    """Different camera move for every shot: zoom in/out and slow pans."""
+    k = idx % 6
+    zin = f"min(1.0+0.0016*on,1.28)"
+    zout = f"max(1.28-0.0016*on,1.0)"
+    if k == 0:
+        return zin, "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    if k == 1:
+        return "1.22", f"(iw-iw/zoom)*on/{frames}", "ih/2-(ih/zoom/2)"
+    if k == 2:
+        return zout, "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    if k == 3:
+        return "1.22", f"(iw-iw/zoom)*(1-on/{frames})", "ih/2-(ih/zoom/2)"
+    if k == 4:
+        return "1.22", "iw/2-(iw/zoom/2)", f"(ih-ih/zoom)*on/{frames}"
+    return "1.22", "iw/2-(iw/zoom/2)", f"(ih-ih/zoom)*(1-on/{frames})"
 
 
 def ken_burns(img, dur, idx, out, flip=False):
     frames = int(round((dur + XF) * FPS))
-    z = "min(1.0+0.0012*on,1.25)" if idx % 2 == 0 else "max(1.25-0.0012*on,1.0)"
-    vf = (("hflip," if flip else "") + f"scale=2160:-1,zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-          f":d={frames}:s={W}x{H}:fps={FPS},format=yuv420p")
+    z, x, y = motion(idx, frames)
+    vf = (("hflip," if flip else "") +
+          "scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,"
+          f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS},format=yuv420p")
     run(["ffmpeg", "-y", "-loglevel", "error", "-i", img, "-vf", vf,
          "-frames:v", frames, "-r", FPS, "-c:v", "libx264", "-preset", "veryfast",
          "-crf", "20", out])
@@ -195,19 +242,29 @@ def main():
                        "dur": d_scene, "voice": voice})
         cursor += d_scene
 
-        base = visuals[i] if i < len(visuals) else (topic or heads[i] or "abstract background")
-        img = TMP / f"img_{i}.jpg"          # one AI image per scene, reused for every shot
-        prompt = (f"{base}, vertical 9:16 cinematic illustration, vibrant colors, "
-                  "dramatic lighting, highly detailed, no text, no watermark")[:380]
-        if not fetch_image(prompt, img, random.randint(1, 10**6)):
-            gradient(img, *PALETTE[i % len(PALETTE)])
+        scene_imgs = []
         for j in range(SHOTS):
             n = len(clips)
+            k = i * SHOTS + j
+            base = (visuals[k] if k < len(visuals)
+                    else f"{visuals[i] if i < len(visuals) else (topic or heads[i] or 'abstract scene')}, "
+                         f"{ANGLES[(k + j) % len(ANGLES)]}")
+            prompt = (f"{base}, vertical 9:16 cinematic illustration, vibrant colors, "
+                      "dramatic lighting, highly detailed, no text, no letters, no watermark")[:380]
+            img = TMP / f"img_{k}.jpg"
+            if fetch_image(prompt, img, random.randint(1, 10**6)):
+                scene_imgs.append(img)
+            elif scene_imgs:
+                img = scene_imgs[-1]          # reuse previous picture of this scene, new camera move
+            else:
+                gradient(img, *rand_pair(k))
             d = d_scene / SHOTS
             clip = TMP / f"clip_{n}.mp4"
-            ken_burns(str(img), d, n, str(clip), flip=(j % 2 == 1))
+            ken_burns(str(img), d, n, str(clip), flip=(img in scene_imgs and j % 2 == 1))
             clips.append(clip)
             shot_durs.append(d)
+            print(f"shot {n + 1}/{len(parts) * SHOTS} done, images ok={STATS['ok']} "
+                  f"fail={STATS['fail']} t={int(time.time() - T0)}s", flush=True)
 
     # animated transitions between every shot
     n = len(clips)
@@ -244,7 +301,8 @@ def main():
          "-movflags", "+faststart", final])
 
     meta = {"title": data.get("title", ""), "duration": round(duration(final), 2),
-            "scenes": len(parts), "shots": n}
+            "scenes": len(parts), "shots": n,
+            "images_ok": STATS["ok"], "images_failed": STATS["fail"]}
     (OUT / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     print("DONE", meta)
 

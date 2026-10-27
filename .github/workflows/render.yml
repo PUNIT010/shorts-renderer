@@ -8,10 +8,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: render-short
+  cancel-in-progress: false
+
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       MAKE_URL: ${{ vars.MAKE_WEBHOOK_URL }}
       MAKE_TOKEN: ${{ vars.MAKE_TOKEN }}
@@ -35,15 +39,18 @@ jobs:
         run: |
           for i in 1 2 3 4 5; do
             jq -nc --arg t "$MAKE_TOKEN" '{event:"generate",token:$t}' \
-              | curl -sS --max-time 90 -X POST -H "Content-Type: application/json" -d @- "$MAKE_URL" -o content.txt || true
-            if grep -q '###' content.txt 2>/dev/null; then break; fi
-            echo "Attempt $i returned no script:"; cat content.txt 2>/dev/null; echo
+              | curl -sS --max-time 150 -X POST -H "Content-Type: application/json" -d @- "$MAKE_URL" -o content.txt || true
+            if grep -q '###' content.txt 2>/dev/null && LC_ALL=C grep -qP '\xe0[\xa4\xa5]' content.txt; then break; fi
+            echo "Attempt $i gave no usable Hindi script:"; cat content.txt 2>/dev/null; echo
             sleep 20
           done
-          grep -q '###' content.txt || { echo "Make did not return a script"; exit 1; }
+          grep -q '###' content.txt && LC_ALL=C grep -qP '\xe0[\xa4\xa5]' content.txt || { echo "Make did not return a Hindi script"; exit 1; }
           head -c 400 content.txt; echo
 
       - name: Render video
+        env:
+          IMAGE_BUDGET: "2700"
+          SHOTS_PER_SCENE: "3"
         run: python render.py content.txt
 
       - name: Publish video as a release asset
@@ -51,7 +58,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="short-$(date -u +%Y%m%d%H%M)"
+          TAG="short-$(date -u +%Y%m%d%H%M)-${GITHUB_RUN_ID}"
           gh release create "$TAG" out/short.mp4 out/meta.json --title "$TAG" --notes "Auto-rendered Short"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
