@@ -19,6 +19,7 @@ jobs:
     env:
       MAKE_URL: ${{ vars.MAKE_WEBHOOK_URL }}
       MAKE_TOKEN: ${{ vars.MAKE_TOKEN }}
+      PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -47,7 +48,34 @@ jobs:
           grep -q '###' content.txt && LC_ALL=C grep -qP '\xe0[\xa4\xa5]' content.txt || { echo "Make did not return a Hindi script"; exit 1; }
           head -c 400 content.txt; echo
 
-      - name: Render video
+      - name: Install PurffleShorts (pinned version)
+        if: env.PIXABAY_API_KEY != ''
+        continue-on-error: true
+        run: pip install "git+https://github.com/Chamanrajragu/purffle-shorts@baaba035be13fa4aa2ebc31951d58ea141e2d74c"
+
+      - name: Render with PurffleShorts (real stock footage)
+        id: purffle
+        if: env.PIXABAY_API_KEY != ''
+        continue-on-error: true
+        env:
+          LANGUAGE: hi
+          TTS_ENGINE: edge
+          TTS_VOICE: hi-IN-SwaraNeural
+          TTS_RATE: "+10%"
+          VISUAL_SOURCES: pixabay,pollinations
+          WATERMARK: none
+          ALIGN: none
+          OUTPUT_DIR: output_videos
+        run: |
+          python make_script.py content.txt script.json
+          python -m purffle_shorts make --script script.json --no-upload
+          V=$(ls -t output_videos/*/short.mp4 | head -1)
+          mkdir -p out
+          cp "$V" out/short.mp4
+          echo '{"engine":"purffleshorts"}' > out/meta.json
+
+      - name: Render video (own renderer, used if PurffleShorts is not available)
+        if: steps.purffle.outcome != 'success'
         env:
           IMAGE_BUDGET: "2700"
           SHOTS_PER_SCENE: "3"

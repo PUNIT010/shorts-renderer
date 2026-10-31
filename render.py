@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -111,7 +112,7 @@ def rand_pair(n):
 
 
 SEEN = set()
-STATS = {"ok": 0, "fail": 0}
+STATS = {"ok": 0, "fail": 0, "clips": 0}
 ANGLES = ["wide establishing shot", "close-up detail shot", "dramatic low angle shot",
           "top-down aerial view", "side view with depth", "macro close-up"]
 
@@ -155,6 +156,60 @@ def fetch_image(prompt, path, seed):
         time.sleep(min(10 + attempt * 10, 60))
     STATS["fail"] += 1
     return False
+
+
+PIXABAY = os.getenv("PIXABAY_API_KEY", "")
+USED_CLIPS = set()
+STOP = set("a an the of in on at to with and or for from by is are over under into near "
+           "vivid scene shot view angle close up wide camera cinematic family friendly "
+           "image showing clearly different people person".split())
+
+
+def keywords(prompt):
+    return [w for w in re.findall(r"[a-z]+", prompt.lower()) if w not in STOP and len(w) > 2]
+
+
+def fetch_clip(prompt, path):
+    """Real stock footage from Pixabay (free key). Returns True if a clip was saved."""
+    if MOCK or not PIXABAY:
+        return False
+    import requests
+    kw = keywords(prompt)
+    tries = [" ".join(kw[:3]), " ".join(kw[:2]), kw[0] if kw else "", "technology", "city"]
+    for q in dict.fromkeys(x for x in tries if x):
+        try:
+            r = requests.get("https://pixabay.com/api/videos/", timeout=40,
+                             params={"key": PIXABAY, "q": q, "per_page": 20, "safesearch": "true"})
+            if r.status_code != 200:
+                print("pixabay status", r.status_code, r.text[:120], flush=True)
+                continue
+            hits = [h for h in r.json().get("hits", []) if h["id"] not in USED_CLIPS]
+            if not hits:
+                continue
+            h = random.choice(hits[:8])
+            v = h["videos"]
+            url = (v.get("large") or {}).get("url") or (v.get("medium") or {}).get("url")
+            if not url:
+                continue
+            data = requests.get(url, timeout=180).content
+            if len(data) < 50000:
+                continue
+            Path(path).write_bytes(data)
+            USED_CLIPS.add(h["id"])
+            STATS["clips"] += 1
+            print(f"pixabay clip '{q}' id={h['id']}", flush=True)
+            return True
+        except Exception as e:
+            print("pixabay retry:", e, flush=True)
+    return False
+
+
+def stock_clip(src, dur, out):
+    """Cut/loop a stock clip to the shot length, fill 9:16 by centre-crop."""
+    run(["ffmpeg", "-y", "-loglevel", "error", "-stream_loop", "-1", "-i", src,
+         "-t", f"{dur + XF:.3f}", "-vf",
+         f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},format=yuv420p",
+         "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", out])
 
 
 def motion(idx, frames):
@@ -249,22 +304,26 @@ def main():
             base = (visuals[k] if k < len(visuals)
                     else f"{visuals[i] if i < len(visuals) else (topic or heads[i] or 'abstract scene')}, "
                          f"{ANGLES[(k + j) % len(ANGLES)]}")
-            prompt = (f"{base}, vertical 9:16 cinematic illustration, vibrant colors, "
-                      "dramatic lighting, highly detailed, no text, no letters, no watermark")[:380]
-            img = TMP / f"img_{k}.jpg"
-            if fetch_image(prompt, img, random.randint(1, 10**6)):
-                scene_imgs.append(img)
-            elif scene_imgs:
-                img = scene_imgs[-1]          # reuse previous picture of this scene, new camera move
-            else:
-                gradient(img, *rand_pair(k))
             d = d_scene / SHOTS
             clip = TMP / f"clip_{n}.mp4"
-            ken_burns(str(img), d, n, str(clip), flip=(img in scene_imgs and j % 2 == 1))
+            src = TMP / f"src_{k}.mp4"
+            if fetch_clip(base, src):
+                stock_clip(str(src), d, str(clip))
+            else:
+                prompt = (f"{base}, vertical 9:16 cinematic illustration, vibrant colors, "
+                          "dramatic lighting, highly detailed, no text, no letters, no watermark")[:380]
+                img = TMP / f"img_{k}.jpg"
+                if fetch_image(prompt, img, random.randint(1, 10**6)):
+                    scene_imgs.append(img)
+                elif scene_imgs:
+                    img = scene_imgs[-1]
+                else:
+                    gradient(img, *rand_pair(k))
+                ken_burns(str(img), d, n, str(clip), flip=(img in scene_imgs and j % 2 == 1))
             clips.append(clip)
             shot_durs.append(d)
             print(f"shot {n + 1}/{len(parts) * SHOTS} done, images ok={STATS['ok']} "
-                  f"fail={STATS['fail']} t={int(time.time() - T0)}s", flush=True)
+                  f"fail={STATS['fail']} clips={STATS['clips']} t={int(time.time() - T0)}s", flush=True)
 
     # animated transitions between every shot
     n = len(clips)
@@ -302,7 +361,7 @@ def main():
 
     meta = {"title": data.get("title", ""), "duration": round(duration(final), 2),
             "scenes": len(parts), "shots": n,
-            "images_ok": STATS["ok"], "images_failed": STATS["fail"]}
+            "images_ok": STATS["ok"], "images_failed": STATS["fail"], "stock_clips": STATS["clips"]}
     (OUT / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     print("DONE", meta)
 
