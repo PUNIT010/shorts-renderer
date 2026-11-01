@@ -37,15 +37,21 @@ jobs:
         run: pip install edge-tts requests pillow
 
       - name: Get today's script from Make
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # recent topics (kept in release notes) so Make does not repeat them
+          AVOID=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=25" \
+            --jq '[.[] | (.body // "") | select(startswith("topic: ")) | ltrimstr("topic: ")] | join("; ")' 2>/dev/null || true)
+          echo "Recent topics to avoid: $AVOID"
           for i in 1 2 3 4 5; do
-            jq -nc --arg t "$MAKE_TOKEN" '{event:"generate",token:$t}' \
+            jq -nc --arg t "$MAKE_TOKEN" --arg a "$AVOID" '{event:"generate",token:$t,content:$a}' \
               | curl -sS --max-time 150 -X POST -H "Content-Type: application/json" -d @- "$MAKE_URL" -o content.txt || true
-            if grep -q '###' content.txt 2>/dev/null && LC_ALL=C grep -qP '\xe0[\xa4\xa5]' content.txt; then break; fi
-            echo "Attempt $i gave no usable Hindi script:"; cat content.txt 2>/dev/null; echo
+            if grep -q '###' content.txt 2>/dev/null && python3 check_content.py content.txt; then break; fi
+            echo "Attempt $i gave no usable script:"; head -c 600 content.txt 2>/dev/null; echo
             sleep 20
           done
-          grep -q '###' content.txt && LC_ALL=C grep -qP '\xe0[\xa4\xa5]' content.txt || { echo "Make did not return a Hindi script"; exit 1; }
+          grep -q '###' content.txt && python3 check_content.py content.txt || { echo "Make did not return a good Hindi script"; exit 1; }
           head -c 400 content.txt; echo
 
       - name: Install PurffleShorts (pinned version)
@@ -87,7 +93,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="short-$(date -u +%Y%m%d%H%M)-${GITHUB_RUN_ID}"
-          gh release create "$TAG" out/short.mp4 out/meta.json --title "$TAG" --notes "Auto-rendered Short"
+          TOPIC=$(python3 -c "print(open('content.txt',encoding='utf-8').read().split('###')[1].strip())")
+          gh release create "$TAG" out/short.mp4 out/meta.json --title "$TAG" --notes "topic: $TOPIC"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Tell Make to upload the video
